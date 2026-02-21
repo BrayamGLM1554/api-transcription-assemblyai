@@ -267,7 +267,8 @@ def transcribe_async():
             # Validar extensión
             allowed_extensions = (
                 '.mp3', '.mp4', '.wav', '.m4a', '.flac', '.ogg', 
-                '.webm', '.aac', '.amr', '.opus', '.wma'
+                '.webm', '.aac', '.amr', '.opus', '.wma',
+                '.mpeg', '.mpga', '.mp2'
             )
             if not audio_file.filename.lower().endswith(allowed_extensions):
                 return jsonify({
