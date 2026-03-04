@@ -15,7 +15,7 @@ CORS(app)  # Permite peticiones desde cualquier origen
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB en bytes
 
 # Configuración de AssemblyAI
-ASSEMBLYAI_API_KEY = os.getenv('ASSEMBLYAI_API_KEY', 'bfa9693c209840539fd901196346c4a6')
+ASSEMBLYAI_API_KEY = os.getenv('ASSEMBLYAI_API_KEY', '5f5fcdb5a90a4a128a5ccc5b399a250b')
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
 PORT = int(os.getenv('PORT', 5000))
 
