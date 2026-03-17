@@ -54,7 +54,7 @@ def transcribe_audio(audio_url, quality_mode="maximum", custom_vocabulary=None):
     data = {
         "audio_url": audio_url,
         "language_detection": True,
-        "speech_model": "universal",
+        "speech_models": ["universal-3-pro", "universal-2"],
         "language_confidence_threshold": 0.7,
         "boost_param": "high",
         "punctuate": True,
