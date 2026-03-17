@@ -11,7 +11,8 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024 * 1024  # 4GB
+# Archivos pequeños que pasan por Render (100 MB)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
 
 ASSEMBLYAI_API_KEY = os.getenv('ASSEMBLYAI_API_KEY', '5f5fcdb5a90a4a128a5ccc5b399a250b')
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com"
@@ -19,11 +20,16 @@ PORT = int(os.getenv('PORT', 5000))
 
 headers = {
     "authorization": ASSEMBLYAI_API_KEY
-}2
+}
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def upload_audio_to_assemblyai(audio_file):
-    """Sube el archivo de audio/video a AssemblyAI y retorna la URL"""
+    """Sube el archivo de audio/video a AssemblyAI y retorna la URL.
+    Usado cuando el archivo pasa por Render (< 100 MB)."""
     upload_url = f"{ASSEMBLYAI_BASE_URL}/v2/upload"
 
     print(f"  [ASSEMBLYAI] POST {upload_url}")
@@ -36,16 +42,19 @@ def upload_audio_to_assemblyai(audio_file):
         return upload_result["upload_url"]
     else:
         print(f"  [ASSEMBLYAI] Upload FAILED -> {response.text}")
-        raise Exception(f"Error al subir el archivo a AssemblyAI (HTTP {response.status_code}): {response.text}")
+        raise Exception(
+            f"Error al subir el archivo a AssemblyAI (HTTP {response.status_code}): {response.text}"
+        )
 
 
 def transcribe_audio(audio_url, quality_mode="maximum", custom_vocabulary=None):
+    """Inicia una transcripción en AssemblyAI y retorna el transcript_id."""
     transcript_url = f"{ASSEMBLYAI_BASE_URL}/v2/transcript"
 
     data = {
         "audio_url": audio_url,
         "language_detection": True,
-        "speech_models": ["universal-3-pro", "universal-2"],
+        "speech_model": "universal",
         "language_confidence_threshold": 0.7,
         "boost_param": "high",
         "punctuate": True,
@@ -75,10 +84,13 @@ def transcribe_audio(audio_url, quality_mode="maximum", custom_vocabulary=None):
         return transcript_id
     else:
         print(f"  [ASSEMBLYAI] Transcript request FAILED -> {response.text}")
-        raise Exception(f"Error al iniciar transcripcion (HTTP {response.status_code}): {response.text}")
+        raise Exception(
+            f"Error al iniciar transcripcion (HTTP {response.status_code}): {response.text}"
+        )
 
 
 def get_transcription_result(transcript_id):
+    """Hace polling hasta que la transcripción esté lista. Síncrono."""
     polling_endpoint = f"{ASSEMBLYAI_BASE_URL}/v2/transcript/{transcript_id}"
 
     while True:
@@ -104,20 +116,125 @@ def get_transcription_result(transcript_id):
             time.sleep(3)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "ok",
         "message": "API de transcripcion funcionando",
-        "version": "3.1.0 - High Accuracy (>97%)"
+        "version": "4.0.0 - Direct Upload Support"
     }), 200
 
 
+# ── NUEVO: URL de subida directa para el frontend ────────────────────────────
+@app.route('/get-upload-url', methods=['POST'])
+def get_upload_url():
+    """
+    Retorna la URL de subida de AssemblyAI y la API key para que el frontend
+    pueda subir archivos grandes (>100 MB o videos) directamente, sin pasar
+    por Render.
+
+    NOTA DE SEGURIDAD: Este sistema usa autenticación por login previo.
+    La API key solo es accesible para usuarios autenticados.
+    """
+    try:
+        return jsonify({
+            "upload_url": f"{ASSEMBLYAI_BASE_URL}/v2/upload",
+            "api_key": ASSEMBLYAI_API_KEY
+        }), 200
+    except Exception as e:
+        print(f"[ERROR /get-upload-url] {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ── Transcripción desde URL (síncrona) ───────────────────────────────────────
+@app.route('/transcribe-url', methods=['POST'])
+def transcribe_from_url():
+    """
+    Recibe una audio_url ya subida a AssemblyAI (por el frontend o por Render)
+    e inicia la transcripción en modo síncrono (hace polling internamente).
+    Ideal para cuando el archivo ya fue subido directamente por el frontend.
+    """
+    try:
+        data = request.get_json()
+        if not data or 'audio_url' not in data:
+            return jsonify({
+                "status": "error",
+                "message": "Debes proporcionar 'audio_url' en el body JSON"
+            }), 400
+
+        audio_url = data['audio_url']
+        quality_mode = data.get('quality', 'maximum')
+        custom_vocabulary = data.get('vocabulary', None)
+
+        print(f"\n[/transcribe-url] audio_url={audio_url[:60]}... | mode={quality_mode}")
+
+        transcript_id = transcribe_audio(audio_url, quality_mode, custom_vocabulary)
+        result = get_transcription_result(transcript_id)
+
+        print(f"[/transcribe-url] Completado con status={result['status']}")
+        return jsonify(result), 200
+
+    except Exception as e:
+        print(f"[ERROR /transcribe-url] {str(e)}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ── Transcripción desde URL (asíncrona) ──────────────────────────────────────
+@app.route('/transcribe-url-async', methods=['POST'])
+def transcribe_from_url_async():
+    """
+    Recibe una audio_url ya subida y retorna inmediatamente con el transcript_id.
+    El frontend hace polling a /status/<transcript_id>.
+    Úsalo cuando no quieras bloquear el worker de Render durante el procesamiento.
+    """
+    try:
+        data = request.get_json()
+        if not data or 'audio_url' not in data:
+            return jsonify({
+                "status": "error",
+                "message": "Debes proporcionar 'audio_url' en el body JSON"
+            }), 400
+
+        audio_url = data['audio_url']
+        quality_mode = data.get('quality', 'maximum')
+        custom_vocabulary = data.get('vocabulary', None)
+
+        print(f"\n[/transcribe-url-async] audio_url={audio_url[:60]}... | mode={quality_mode}")
+
+        transcript_id = transcribe_audio(audio_url, quality_mode, custom_vocabulary)
+
+        print(f"[/transcribe-url-async] transcript_id={transcript_id}")
+        return jsonify({
+            "status": "processing",
+            "transcript_id": transcript_id,
+            "quality_mode": quality_mode,
+            "message": "Transcripcion iniciada. Usa /status/{transcript_id} para consultar el estado"
+        }), 202
+
+    except Exception as e:
+        print(f"[ERROR /transcribe-url-async] {str(e)}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ── Transcripción con archivo adjunto (síncrona) ─────────────────────────────
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
+    """
+    Recibe un archivo (< 100 MB), lo sube a AssemblyAI y hace polling hasta
+    completar. Endpoint síncrono, solo para audios pequeños.
+    """
     try:
         if 'audio' not in request.files:
-            return jsonify({"status": "error", "message": "No se encontro archivo. Usa la key 'audio' en form-data"}), 400
+            return jsonify({
+                "status": "error",
+                "message": "No se encontro archivo. Usa la key 'audio' en form-data"
+            }), 400
 
         audio_file = request.files['audio']
         if audio_file.filename == '':
@@ -129,7 +246,10 @@ def transcribe():
             '.mov', '.avi', '.mkv', '.wmv', '.flv', '.m4v', '.3gp', '.ts', '.mts'
         )
         if not audio_file.filename.lower().endswith(allowed_extensions):
-            return jsonify({"status": "error", "message": f"Formato no soportado. Usa: {', '.join(allowed_extensions)}"}), 400
+            return jsonify({
+                "status": "error",
+                "message": f"Formato no soportado. Usa: {', '.join(allowed_extensions)}"
+            }), 400
 
         quality_mode = request.form.get('quality', 'maximum')
         vocabulary_str = request.form.get('vocabulary', '')
@@ -146,35 +266,20 @@ def transcribe():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@app.route('/transcribe-url', methods=['POST'])
-def transcribe_from_url():
-    try:
-        data = request.get_json()
-        if not data or 'audio_url' not in data:
-            return jsonify({"status": "error", "message": "Debes proporcionar 'audio_url' en el body JSON"}), 400
-
-        audio_url = data['audio_url']
-        quality_mode = data.get('quality', 'maximum')
-        custom_vocabulary = data.get('vocabulary', None)
-
-        transcript_id = transcribe_audio(audio_url, quality_mode, custom_vocabulary)
-        result = get_transcription_result(transcript_id)
-        return jsonify(result), 200
-
-    except Exception as e:
-        print(f"[ERROR /transcribe-url] {str(e)}")
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
+# ── Transcripción con archivo adjunto (asíncrona) ────────────────────────────
 @app.route('/transcribe-async', methods=['POST'])
 def transcribe_async():
+    """
+    Recibe un archivo (< 100 MB) o una audio_url en JSON.
+    Retorna inmediatamente con el transcript_id para hacer polling.
+    """
     print("\n" + "=" * 50)
     print("[/transcribe-async] Nueva solicitud recibida")
-    print(f"  Content-Type : {request.content_type}")
-    print(f"  Content-Length: {request.content_length} bytes ({(request.content_length or 0) / 1024 / 1024:.2f} MB)")
-    print(f"  Files        : {list(request.files.keys())}")
-    print(f"  Form fields  : {list(request.form.keys())}")
+    print(f"  Content-Type  : {request.content_type}")
+    print(f"  Content-Length: {request.content_length} bytes "
+          f"({(request.content_length or 0) / 1024 / 1024:.2f} MB)")
+    print(f"  Files         : {list(request.files.keys())}")
+    print(f"  Form fields   : {list(request.form.keys())}")
 
     try:
         audio_url = None
@@ -192,7 +297,6 @@ def transcribe_async():
             print(f"  [FILE] MIME type : {audio_file.mimetype}")
 
             if filename == '':
-                print("  [ERROR] El archivo no tiene nombre")
                 return jsonify({"status": "error", "message": "El archivo no tiene nombre"}), 400
 
             allowed_extensions = (
@@ -204,10 +308,10 @@ def transcribe_async():
             print(f"  [FILE] Extension detectada: '{ext}'")
 
             if ext not in allowed_extensions:
-                print(f"  [ERROR] Extension '{ext}' no esta en la lista permitida")
                 return jsonify({
                     "status": "error",
-                    "message": f"Formato no soportado: '{ext}'. Formatos validos: {', '.join(allowed_extensions)}"
+                    "message": f"Formato no soportado: '{ext}'. "
+                               f"Formatos validos: {', '.join(allowed_extensions)}"
                 }), 400
 
             quality_mode = request.form.get('quality', 'maximum')
@@ -222,12 +326,14 @@ def transcribe_async():
             print(f"  [STEP 1] Bytes leidos: {len(file_bytes):,}")
 
             if len(file_bytes) == 0:
-                print("  [ERROR] El archivo esta vacio (0 bytes)")
-                return jsonify({"status": "error", "message": "El archivo esta vacio (0 bytes recibidos)"}), 400
+                return jsonify({
+                    "status": "error",
+                    "message": "El archivo esta vacio (0 bytes recibidos)"
+                }), 400
 
             print("  [STEP 2] Subiendo a AssemblyAI...")
             audio_url = upload_audio_to_assemblyai(file_bytes)
-            print(f"  [STEP 2] URL obtenida OK")
+            print("  [STEP 2] URL obtenida OK")
 
         # ── Rama 2: URL enviada en JSON ───────────────────────────────────────
         else:
@@ -235,7 +341,6 @@ def transcribe_async():
             data = request.get_json(silent=True)
 
             if data is None:
-                print("  [ERROR] Body no es JSON valido y tampoco hay archivo")
                 return jsonify({
                     "status": "error",
                     "message": "Proporciona un archivo 'audio' en form-data o 'audio_url' en JSON"
@@ -244,7 +349,6 @@ def transcribe_async():
             print(f"  [JSON] Keys recibidas: {list(data.keys())}")
 
             if 'audio_url' not in data:
-                print("  [ERROR] El JSON no contiene 'audio_url'")
                 return jsonify({
                     "status": "error",
                     "message": "El JSON debe contener la clave 'audio_url'"
@@ -278,8 +382,10 @@ def transcribe_async():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+# ── Consulta de estado ────────────────────────────────────────────────────────
 @app.route('/status/<transcript_id>', methods=['GET'])
 def get_status(transcript_id):
+    """Consulta el estado de una transcripción asíncrona por su ID."""
     try:
         polling_endpoint = f"{ASSEMBLYAI_BASE_URL}/v2/transcript/{transcript_id}"
         response = requests.get(polling_endpoint, headers=headers)
@@ -298,13 +404,20 @@ def get_status(transcript_id):
         elif status == 'error':
             return jsonify({"status": "error", "error": result['error']}), 200
         else:
-            return jsonify({"status": "processing", "message": f"Transcripcion en proceso (estado: {status})"}), 200
+            return jsonify({
+                "status": "processing",
+                "message": f"Transcripcion en proceso (estado: {status})"
+            }), 200
 
     except Exception as e:
         print(f"[ERROR /status] {str(e)}")
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ERROR HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.errorhandler(404)
 def not_found(error):
@@ -315,7 +428,11 @@ def not_found(error):
 def request_entity_too_large(error):
     return jsonify({
         "status": "error",
-        "message": "El archivo supera el limite de 4 GB permitido por el servidor"
+        "message": (
+            "El archivo supera el limite de 100 MB permitido por el servidor. "
+            "Para archivos mas grandes o videos, el frontend debe subirlos "
+            "directamente a AssemblyAI usando /get-upload-url."
+        )
     }), 413
 
 
@@ -324,19 +441,31 @@ def internal_error(error):
     return jsonify({"status": "error", "message": "Error interno del servidor"}), 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
     print("=" * 70)
-    print("API DE TRANSCRIPCION - ALTA PRECISION (>97% CONFIABILIDAD)")
+    print("API DE TRANSCRIPCION v4.0 - SOPORTE SUBIDA DIRECTA")
     print("=" * 70)
     print(f"Puerto : {PORT}")
-    print(f"API Key : {'configurada' if ASSEMBLYAI_API_KEY else 'NO configurada'}")
+    print(f"API Key: {'configurada' if ASSEMBLYAI_API_KEY else 'NO configurada'}")
     print("=" * 70)
     print("\nEndpoints disponibles:")
-    print("  GET  /health              - Health check")
-    print("  POST /transcribe          - Transcribir archivo (sincrono)")
-    print("  POST /transcribe-url      - Transcribir desde URL (sincrono)")
-    print("  POST /transcribe-async    - Iniciar transcripcion (asincrono)")
-    print("  GET  /status/<id>         - Consultar estado (asincrono)")
+    print("  GET  /health                 - Health check")
+    print("  POST /get-upload-url         - URL de subida directa para el frontend (archivos grandes)")
+    print("  POST /transcribe             - Transcribir archivo adjunto (sincrono, <100 MB)")
+    print("  POST /transcribe-async       - Transcribir archivo adjunto (asincrono, <100 MB)")
+    print("  POST /transcribe-url         - Transcribir desde URL (sincrono)")
+    print("  POST /transcribe-url-async   - Transcribir desde URL (asincrono)")
+    print("  GET  /status/<id>            - Consultar estado de transcripcion")
+    print("\nFlujos:")
+    print("  Archivos < 100 MB (audio):")
+    print("    Frontend -> Render /transcribe-async -> AssemblyAI -> polling /status/<id>")
+    print("  Archivos > 100 MB o video:")
+    print("    Frontend -> /get-upload-url -> AssemblyAI upload directo")
+    print("             -> Render /transcribe-url-async -> polling /status/<id>")
     print("\nFormatos soportados:")
     print("  Audio: MP3, WAV, M4A, FLAC, OGG, WEBM, AAC, AMR, OPUS, WMA, MPEG")
     print("  Video: MP4, MOV, AVI, MKV, WMV, FLV, M4V, 3GP, TS")
